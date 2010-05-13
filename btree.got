@@ -1,0 +1,524 @@
+package btree(type T)
+
+import "fmt"
+
+const max int = 22
+
+type Less func(a,b T) bool
+
+type SortedSet interface {
+  Front() T
+  Insert(T) bool
+  Remove(T) bool
+  Contains(T) bool
+  Len() int
+
+  // Returns a channel that gets passed every element in the set in order, and is then closed.
+  Data() <-chan T
+}
+
+type BTree struct {
+  node  bNode
+  size  int
+  less  Less
+}
+func (t *BTree) Front() T {
+  if t.size == 0 { panic("Can't call Front() on an empty tree.") }
+  return t.node.front()
+}
+func (t *BTree) Contains(data T) bool {
+  return t.node.contains(data, t.less)
+}
+func (t *BTree) Data() <-chan T {
+  c := make(chan T)
+  go func() {
+    t.node.traverse(c)
+    close(c)
+  } ()
+  return c
+}
+
+func (t *BTree) Remove(data T) bool {
+  if t.size == 0 { return false }
+  if !t.node.remove(data, t.less) { return false }
+  t.size--
+  if inode,ok := t.node.(*internalNode); ok {
+    if inode.lenKeys() == 0 {
+      t.node = inode.child[0]
+    }
+  }
+  return true
+}
+
+func (t *BTree) Len() int {
+  return t.size
+}
+
+func (t *BTree) show() {
+  t.node.show(0)
+}
+
+func (t *BTree) fsck() bool {
+  return t.node.fsck(0, t.less)
+}
+
+func (t *BTree) Insert(data T) bool {
+  added,spawn,val := t.node.insert(data, t.less)
+  if !added { return false }
+  t.size++
+  if spawn == nil { return true }
+  root := new(internalNode)
+  root.child = make([]bNode, max+2)[0:0]
+  root.key = make([]T, max+1)[0:0]
+  
+  root.child = root.child[0:2]
+  root.child[0] = t.node
+  root.child[1] = spawn
+  root.key = root.key[0:1]
+  root.key[0] = val
+  t.node = root
+  return true
+}
+
+func NewTree(less Less) *BTree {
+  t := new(BTree)
+  kn := new(keyNode)
+  kn.key = make([]T, max+1)[0:0]
+  t.node = kn
+  t.less = less
+  return t
+}
+
+type visitor func(bNode) (int,int)
+type bNode interface {
+  // Inserts the value into the appropriate place in the tree, rebalancing as necessary.  The first
+  // return value specifies if the value was actually added (i.e. if it wasn't already there).  If a
+  // new node is created it is returned along with a separator value.
+  insert(T, Less) (bool, bNode, T)
+
+  // Removes the value from the tree, rebalancing as necessary.  Returns true iff an element was
+  // actually deleted.
+  remove(T, Less) bool
+
+  // Returns true iff this tree contains the value.
+  contains(T, Less) bool
+
+  // Returns the lowest element in the tree.
+  front() T
+
+  // Convenient development methods
+  show(int)             // Textual display of a tree
+  fsck(int, Less) bool  // Does a quick sanity check to make sure the tree is in order.
+
+  // Grabs all of the data in bNode and merges it into this node.  Performs no checks while doing
+  // so.
+  merge(bNode)
+
+  // Like merge, but additionally adds an additional separator between the keys in the two nodes.
+  mergeWithSeparator(bNode,T)
+
+  // We frequently need to ask about the number of keys in the node, and even though all nodes
+  // contain keyNode, we still can't access that without either a type check or exposing this
+  // method.
+  lenKeys() int
+
+  // Passes all of the data in this node and its children through the cannel in proper order.
+  traverse(chan<- T)
+
+  // This is a method that provides a flexible way of traversing and deleting and element from the
+  // tree.  The function returns two elements (traverse, delete), which indicate the index of which
+  // element should be traversed or deleted.  A value of -1 is ignored, and at least one of them
+  // will always be -1.  This allows us to traverse and delete a specific value from the tree, as
+  // well as deleting the upper or lower bound of a value.
+  traverseAndDelete(visitor) (bool, T)
+
+  // The following methods are used in conjunction with traverseAndDelete
+  deleteMin() (int,int)
+  deleteMax() (int,int)
+  deleteTarget(T, Less) (int,int)
+}
+
+type keyNode struct {
+  key   []T
+}
+
+type internalNode struct {
+  keyNode
+  child []bNode
+}
+
+func (node *keyNode) lenKeys() int {
+  return len(node.key)
+}
+
+func (node *keyNode) traverse(c chan<- T) {
+  for _,v := range node.key {
+    c <- v
+  }
+}
+
+func (node *internalNode) traverse(c chan<- T) {
+  for i := range node.key {
+    node.child[i].traverse(c)
+    c <- node.key[i]
+  }
+  node.child[len(node.child)-1].traverse(c)
+}
+
+func (node *keyNode) front() T {
+  return node.key[0]
+}
+
+func (node *internalNode) front() T {
+  return node.child[0].front()
+}
+
+func (node *keyNode) contains(t T, less Less) bool {
+  _,exists := node.nodeUpperBound(t, less)
+  return exists
+}
+
+func (node *internalNode) contains(t T, less Less) bool {
+  index,exists := node.nodeUpperBound(t, less)
+  if exists { return true }
+  return node.child[index].contains(t, less)
+}
+
+func (node *keyNode) deleteKeyAtIndex(index int) {
+  node.key = node.key[0 : len(node.key)+1]     // Even though the space is there, copy won't work
+  copy(node.key[index:], node.key[index+1:])   // unless we've made room for it.  We could also have
+  node.key = node.key[0 : len(node.key)-2]     // just skipped the copy if index == len(node.key)-1
+}
+
+// returns (successful,data)
+// successful is true iff a value was deleted
+// if successful, data is the element that was deleted
+func (node *keyNode) traverseAndDelete(traverse_or_delete visitor) (bool, T) {
+  // in a leaf we are no longer traversing, so we just call the delete function
+  traverse, delete := traverse_or_delete(node)
+  if traverse >= 0 { panic("Cannot traverse past a leaf.") }
+  if delete < 0 { return false, node.key[0] }
+  data := node.key[delete]
+  node.deleteKeyAtIndex(delete)
+  return true, data
+}
+
+func (node *internalNode) deleteChildAtIndex(index int) {
+  node.child = node.child[0 : len(node.child)+1]
+  copy(node.child[index:], node.child[index+1:])
+  node.child = node.child[0 : len(node.child)-2]
+}
+
+func (node *internalNode) rebalance(index int) bool {
+  if node.child[index].lenKeys() >= max/2 { return false }
+
+  if index > 0 && node.child[index-1].lenKeys() > max/2 {
+    // Our target child's left sibling has extra elements, so we'll take one of those
+//    fmt.Printf("RotateRight around %d\n", node.key[index])
+    node.rotateRight(index)
+    return false
+  }
+//  fmt.Printf("%d %d %d\n", index, len(node.key), node.child[index+1].lenKeys())
+  if index < len(node.key) && node.child[index+1].lenKeys() > max/2 {
+    node.rotateLeft(index)
+    return false
+  }
+
+  // Neither sibling had any elements we could steal, so we are going to merge two nodes together.
+  // We know there will be room for this because if there isn't that means a sibling has an extra
+  // element, and we already would have gotten it.
+  low_index := index
+  if index > 0 {
+    low_index = low_index-1
+  }
+  node.child[low_index].mergeWithSeparator(node.child[low_index+1], node.key[low_index])
+  node.deleteKeyAtIndex(low_index)
+  node.deleteChildAtIndex(low_index+1)
+  return true
+}
+
+func deleteMax(node bNode) (int,int) { return node.deleteMax() }
+func (node *internalNode) deleteMax() (int,int) { return len(node.child) - 1, -1 }
+func (node *keyNode) deleteMax() (int,int) { return -1, len(node.key) - 1 }
+func deleteMin(node bNode) (int,int) { return node.deleteMin() }
+func (node *internalNode) deleteMin() (int,int) { return 0, -1 }
+func (node *keyNode) deleteMin() (int,int) { return -1, 0 }
+
+func (node *internalNode) traverseAndDelete(traverse_or_delete visitor) (bool, T) {
+  traverse, delete := traverse_or_delete(node)
+  if traverse >= 0 && delete >= 0 { panic("Can't delete and traverse at the same node.") }
+  if traverse < 0 && delete < 0 { return false, node.key[0] }
+  if traverse >= 0 {
+    deleted, data := node.child[traverse].traverseAndDelete(traverse_or_delete)
+    node.rebalance(traverse)
+    return deleted, data
+  }
+  if delete >= 0 {
+    data := node.key[delete]
+    if node.child[delete].lenKeys() + node.child[delete+1].lenKeys() == max {
+      _, val := node.child[delete].traverseAndDelete(deleteMax)
+      if node.child[delete].lenKeys() >= max/2 {
+        node.key[delete] = val
+      } else {
+        node.child[delete].mergeWithSeparator(node.child[delete+1], val)
+        node.deleteKeyAtIndex(delete)
+        node.deleteChildAtIndex(delete+1)
+      }
+      return true,data
+    }
+    if node.child[delete].lenKeys() > max/2 {
+      _, val := node.child[delete].traverseAndDelete(deleteMax)
+      node.key[delete] = val
+    } else {
+      _, val := node.child[delete+1].traverseAndDelete(deleteMin)
+      node.key[delete] = val
+    }
+    return true,data
+  }
+  return false, node.key[0]
+}
+
+// Utility methods *********************************************************************************
+
+// Returns the index of the smallest value that is not less than t, and whether or not it equals t
+// If there are no elements which t is smaller than it returns (len(node.key), false)
+func (node *keyNode) nodeUpperBound(t T, less Less) (int,bool) {
+  if len(node.key) == 0 { return 0, false }
+  low,high := 0,len(node.key)
+
+  for high-low > 8 {
+    mid := (high+low) / 2
+    if less(t, node.key[mid]) {
+      high = mid
+    } else {
+      low = mid
+    }
+  }
+
+  for i := low; i < high; i++ {
+    if !less(node.key[i], t) {
+      return i, !less(t, node.key[i])
+    }
+  }
+
+  return high, false
+}
+
+func (node *keyNode) merge(_sib bNode) {
+  sib := _sib.(*keyNode)
+  node.key = node.key[0 : len(node.key) + len(sib.key)]
+  copy(node.key[len(node.key)-len(sib.key):], sib.key)
+}
+
+// Rotates right such that the child at the specified index will have one more element, and the
+// child to its left will have one less.
+func (node *internalNode) rotateRight(index int) {
+  separator := node.key[index-1]
+  switch target := node.child[index].(type) {
+    case *keyNode:
+      source := node.child[index-1].(*keyNode)
+      node.key[index-1] = source.key[len(source.key)-1]
+      source.key = source.key[0 : len(source.key)-1]
+      target.key = target.key[0 : len(target.key)+1]
+      copy(target.key[1:], target.key[0:])
+      target.key[0] = separator
+
+    case *internalNode:
+      source := node.child[index-1].(*internalNode)
+      node.key[index-1] = source.key[len(source.key)-1]   // These five lines are an exact
+      source.key = source.key[0 : len(source.key)-1]      // copy of the ones above.
+      target.key = target.key[0 : len(target.key)+1]      // TODO: Remove this duplication
+      copy(target.key[1:], target.key[0:])
+      target.key[0] = separator
+
+      target.child = target.child[0 : len(target.child)+1]
+      copy(target.child[1:], target.child[0:])
+      target.child[0] = source.child[len(source.child)-1]
+      source.child = source.child[0 : len(source.child)-1]
+
+    default:
+      panic("Undefined node type.")
+  }
+}
+
+// Rotates left such that the child at the specified index will have one more element, and the
+// child to its right will have one less.
+func (node *internalNode) rotateLeft(index int) {
+  separator := node.key[index]
+  switch target := node.child[index].(type) {
+    case *keyNode:
+      source := node.child[index+1].(*keyNode)
+      node.key[index] = source.key[0]
+      copy(source.key[0:], source.key[1:])
+      source.key = source.key[0 : len(source.key)-1]
+      target.key = target.key[0 : len(target.key)+1]
+      target.key[len(target.key)-1] = separator
+
+    case *internalNode:
+      source := node.child[index+1].(*internalNode)
+      node.key[index] = source.key[0]
+      copy(source.key[0:], source.key[1:])
+      source.key = source.key[0 : len(source.key)-1]
+      target.key = target.key[0 : len(target.key)+1]
+      target.key[len(target.key)-1] = separator
+
+      target.child = target.child[0 : len(target.child)+1]
+      target.child[len(target.child)-1] = source.child[0]
+      copy(source.child[0:], source.child[1:])
+      source.child = source.child[0 : len(source.child)-1]
+
+    default:
+      panic("Undefined node type.")
+  }
+}
+
+func (node *internalNode) merge(_sib bNode) {
+  sib := _sib.(*internalNode)
+  node.key = node.key[0 : len(node.key) + len(sib.key)]
+  copy(node.key[len(node.key)-len(sib.key):], sib.key)
+  node.child = node.child[0 : len(node.child) + len(sib.child)]
+  copy(node.child[len(node.child)-len(sib.child):], sib.child)
+}
+
+func (node *internalNode) mergeWithSeparator(sib bNode, separator T) {
+  node.key = node.key[0 : len(node.key) + 1]
+  node.key[len(node.key)-1] = separator
+  node.merge(sib)
+}
+
+func (node *keyNode) mergeWithSeparator(sib bNode, separator T) {
+  node.key = node.key[0 : len(node.key) + 1]
+  node.key[len(node.key)-1] = separator
+  node.merge(sib)
+}
+
+func (node *keyNode) deleteTarget(t T, less Less) (int,int) {
+  index, exists := node.nodeUpperBound(t, less)
+  if !exists { index = -1}
+  return -1, index
+}
+func (node *internalNode) deleteTarget(t T, less Less) (int,int) {
+  index, exists := node.nodeUpperBound(t, less)
+  if exists { return -1, index }
+  return index, -1
+}
+func deleteTargetFunc(t T, less Less) func(bNode) (int,int) {
+  return func(node bNode) (int,int) {
+    return node.deleteTarget(t, less)
+  }
+}
+func (node *internalNode) remove(t T, less Less) bool {
+  deleted,_ := node.traverseAndDelete(deleteTargetFunc(t, less))
+  return deleted
+}
+func (node *keyNode) remove(t T, less Less) bool {
+  deleted,_ := node.traverseAndDelete(deleteTargetFunc(t, less))
+  return deleted
+}
+
+
+// Inserts *****************************************************************************************
+func (node *keyNode) insert(t T, less Less) (bool, bNode, T) {
+  index, exists := node.nodeUpperBound(t, less)
+  if exists { return false, nil, node.key[0] }
+  node.key = node.key[0 : len(node.key) + 1]  // Make space in the key array
+  copy(node.key[index+1:], node.key[index:])  // Shift existing data out of the way
+  node.key[index] = t                         // Add our new datum in its place
+
+  if len(node.key) <= max {
+    return true,nil,node.key[0]
+  }
+
+  // We have too many elements, so we need to split
+  spawn := new(keyNode)
+  spawn.key = make([]T, max+1)[0:max/2]
+  copy(spawn.key[0:], node.key[max/2+1:])
+  median := node.key[max/2]
+  node.key = node.key[0:max/2]
+
+  return true,spawn,median
+}
+
+func (node *internalNode) insert(t T, less Less) (bool, bNode, T) {
+  index, exists := node.nodeUpperBound(t, less)
+  if exists { return false, nil, node.key[0] }
+
+  added,infant,val := node.child[index].insert(t, less)
+
+  if infant == nil { return added,nil,node.key[0] }
+
+  // A child node split when we added t, so we have to add in the new node
+  node.key = node.key[0 : len(node.key)+1]
+  copy(node.key[index+1:], node.key[index:])
+  node.key[index] = val
+  node.child = node.child[0 : len(node.child)+1]
+  copy(node.child[index+1:], node.child[index:])
+  node.child[index+1] = infant
+
+  if len(node.key) <= max { return true,nil,node.key[0] }
+
+  // Now this node is too full, so we have to split
+  spawn := new(internalNode)
+  spawn.key = make([]T, max+1)[0:max/2]
+  spawn.child = make([]bNode, max+2)[0:max/2+1]
+  copy(spawn.key, node.key[max/2+1:])
+  copy(spawn.child, node.child[max/2+1:])
+
+  median := node.key[max/2]
+  node.key = node.key[0:max/2]
+  node.child = node.child[0:max/2+1]
+
+  return true,spawn,median
+}
+
+
+// Development and testing utilities ***************************************************************
+func (node *keyNode) show(depth int) {
+  for i := 0; i < depth*2; i++ {
+    fmt.Printf(" ")
+  }
+  fmt.Printf("%v\n", node.key)
+}
+
+func (node *internalNode) show(depth int) {
+  for i := range node.key {
+    node.child[i].show(depth+1)
+    for i := 0; i < depth*2; i++ {
+      fmt.Printf(" ")
+    }
+    fmt.Printf("%d\n", node.key[i])
+  }
+  node.child[len(node.child)-1].show(depth+1)
+}
+
+func (node *keyNode) fsck(depth int, less Less) bool {
+  if len(node.key) < max/2 && depth > 0 { return false }
+  for i := 0; i < len(node.key) - 1; i++ {
+    if !less(node.key[i], node.key[i+1]) { return false }
+  }
+  return true
+}
+
+func (node *internalNode) fsck(depth int, less Less) bool {
+  if len(node.key) < max/2 && depth > 0 { return false }
+  for i := range node.child {
+    if !node.child[i].fsck(depth+1, less) { return false }
+  }
+  for i := 0; i < len(node.key) - 1; i++ {
+    if !less(node.key[i], node.key[i+1]) { return false }
+    if inode,ok := node.child[i].(*internalNode); ok {
+      if less(node.key[i], inode.key[len(inode.key)-1]) { return false }
+    }
+    if lnode,ok := node.child[i].(*keyNode); ok {
+      if less(node.key[i], lnode.key[len(lnode.key)-1]) { return false }
+    }
+    if inode,ok := node.child[i+1].(*internalNode); ok {
+      if less(inode.key[len(inode.key)-1], node.key[i]) { return false }
+    }
+    if lnode,ok := node.child[i+1].(*keyNode); ok {
+      if less(lnode.key[len(lnode.key)-1], node.key[i]) { return false }
+    }
+  }
+  return true
+}
+
