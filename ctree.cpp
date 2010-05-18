@@ -1,3 +1,6 @@
+// Copyright (c) 2010, Jonathan Wills (runningwild@gmail.com)
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 #include <set>
 #include <algorithm>
 #include <vector>
